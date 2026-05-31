@@ -1,0 +1,12 @@
+# Python / circuit-synth
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+# KiCad backups & caches
+*.kicad_prl
+*.kicad_sch-bak
+*-backups/
+fp-info-cache
+# OS
+.DS_Store
