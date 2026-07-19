@@ -1,43 +1,37 @@
-# 🧠 Second-Brain Recorder
+# 🏷️ lintbadge
 
-> An open-source, single-board, all-SMD **always-on audio recorder** that acts as a *second brain*.
-> It records the sounds around you, stores them locally, and — when connected to your phone (iPhone or Android) —
-> appears as a **drive**. A partner app then processes the audio in the cloud and turns it into
-> structured **Obsidian** notes.
+> A **badge-form, employee-ready AI voice recorder** — clip-on/lanyard, retro-futuristic polish.
+> Bluetooth call recording, dual studio mics, 8+ hours battery, seamless sync to Lint app/ERPNext.
+> Zero-subscription, private AI processing via LintLabs backend.
 
-**Status:** 🟡 Design / analysis phase. No board has been fabricated yet. This repo currently
-contains the architecture analysis, component selection, power budget, and a 3D layout mockup.
+**Status:** 🟡 Pivot to v1.0 — full development & production plan. Firmware skeleton + companion app skeleton ready.
 
 ---
 
 ## The mission
 
-Build a tiny, cheap, single PCB that:
+Build a **badge-form wearable** that employees clip on or wear on a lanyard in meetings/calls:
 
-1. **Listens continuously** and records when sound is detected (voice-activity-triggered).
-2. **Compresses** the audio (ADPCM) and **stores it locally** on onboard flash.
-3. **Connects to iPhone & Android** and presents itself as a **USB drive** (USB Mass Storage),
-   so the recordings can be pulled off without any special driver.
-4. A **partner app** uploads the audio for **cloud transcription**, then generates
-   **Obsidian** markdown notes — your searchable second brain.
+1. **Records** via Bluetooth HFP (both sides of a call), dual room mics (group discussions), or whisper mode (long-press).
+2. **Stores locally** on SD/eMMC (1000+ hours of audio).
+3. **Pairs via BLE** to the Lint Voice companion app (iOS/Android/Mac) for live status + quick sync.
+4. **Syncs via Wi-Fi** to your self-hosted LintLabs backend (Whisper transcription → summary → ERPNext/Slack).
+5. **Zero monthly fees** — all core AI runs on your own servers.
 
-## Hardware at a glance (recommended design)
+## Hardware at a glance (Lint Badge v1.0)
 
 | Block | Part | Why |
 |---|---|---|
-| MCU | **RP2040** (QFN-56) | Cheap, native USB Mass Storage, PIO handles the mic — **no radio needed** |
-| Storage | **W25N01GV** 128 MB SPI NAND | ~2.5–4.5 h of compressed audio |
-| Boot flash | W25Qxx SPI NOR | RP2040 boots from external QSPI flash |
-| Microphone | MEMS PDM mic (MSM261) | Digital audio in, all-SMD, no analog circuitry |
-| Power | **TP4056** Li-Po charger + **ME6211** 3.3 V LDO | USB-C charge, simple linear rail |
-| Connector | USB-C 16P SMD | Charge **and** data (the "drive") over one port |
-| Board | ~**22 × 42 mm**, **2-layer** FR-4 | JLCPCB's cheapest standard stack-up |
+| MCU | **ESP32-C6-MINI-1** (4MB Flash) | Wi-Fi 6 + BLE 5.3 + 802.15.4; HFP sink for calls |
+| Audio | **Dual TDK ICS-43434** I2S MEMS + **ES8311** codec | Studio-grade, noise reduction ready |
+| Storage | **MicroSD slot + 128 GB U3** (or 64 GB eMMC) | 1000+ hours recording |
+| Battery | **3.7 V 1200 mAh** LiPo (JST-PH, PCM protected) | 8–10 hrs continuous |
+| PMU | **TP4056** + **MAX17048** fuel gauge + **TPS63101** buck-boost | Smart charging + battery % to app |
+| Connectivity | BLE (pairing) + Wi-Fi (bulk sync) | Dual-mode, no cable needed |
+| Form factor | **55 × 35 × 12 mm** badge (shirt-clip + lanyard + magnets) | Retro-futuristic Lint branding |
+| Extras | WS2812B RGB LED + 3 tactile buttons (PWR/Mode/Whisper) | Status + controls |
 
-Estimated parts cost: **~$5–8** per board in small quantities.
-
-> There are **two viable architectures** — a cheaper **USB-only RP2040** board (recommended, above)
-> and a **wireless ESP32-S3** board that adds Bluetooth sync. See
-> [`docs/02-architecture.md`](docs/02-architecture.md) for the full trade-off.
+Estimated parts cost: **~$48–62** per unit (100 pcs: ~$48/unit, prototype ~$80).
 
 ## Repository layout
 
@@ -47,28 +41,33 @@ Estimated parts cost: **~$5–8** per board in small quantities.
 ├── LICENSE                    ← MIT
 ├── docs/
 │   ├── 01-mission.md          ← product mission & end-to-end flow
-│   ├── 02-architecture.md     ← RP2040-vs-ESP32-S3 decision, store-and-forward
-│   ├── 03-hardware-bom.md     ← components, real dimensions, JLCPCB notes
-│   ├── 04-power-battery.md    ← current draw & battery-life analysis
-│   ├── 05-storage.md          ← SMD flash vs microSD, capacity & cost
-│   ├── 06-connectivity.md     ← USB drive on iPhone/Android, BLE, MFi caveats
-│   └── 07-manufacturing.md    ← what JLCPCB needs, next steps, open items
+│   ├── 02-architecture.md     ← ESP32-C6 architecture (BLE + Wi-Fi + HFP)
+│   ├── 03-hardware-bom.md     ← full Lint Badge BOM (14 components)
+│   ├── 04-power-battery.md    ← power analysis for ESP32-C6 + badge form
+│   ├── 05-storage.md          ← SD card / eMMC storage (128 GB+)
+│   ├── 06-connectivity.md     ← BLE pairing + Wi-Fi sync (replaces USB-only)
+│   └── 07-manufacturing.md    ← PCBWay assembly, 3D resin case plan
+├── firmware/                  ← ESP-IDF firmware skeleton
+│   └── main/                  ← audio, BT, BLE, Wi-Fi, storage, power, buttons, modes
+├── app/                       ← Flutter companion app skeleton
+│   └── lib/                   ← BLE pairing, sync, meeting notes
 └── hardware/
-    └── board-3d.html          ← three.js 3D mockup of the board (open in a browser)
+    └── board-3d.html          ← three.js 3D mockup (badge form factor)
 ```
 
 ## Viewing the 3D mockup
 
 Open [`hardware/board-3d.html`](hardware/board-3d.html) in any modern browser. It renders the
-board with all components placed to **real datasheet dimensions**. It is a **cosmetic mockup only** —
+badge with all components placed to **real datasheet dimensions**. It is a **cosmetic mockup only** —
 it does not simulate any electrical behavior.
 
 ## Honest scope & disclaimers
 
-- This is a **design analysis**, not a finished, validated product. Nothing here has been fabricated or bench-tested.
+- This is a **design analysis + skeleton code**, not a finished, validated product. Nothing here has been fabricated or bench-tested.
 - The schematic still needs to be drawn and the **PCB routed** in KiCad before it can go to a fab.
-- "Recording all sounds around you" has **serious legal and privacy implications** — recording
+- "Recording audio" has **serious legal and privacy implications** — recording
   people without consent is illegal in many jurisdictions. See [`docs/01-mission.md`](docs/01-mission.md).
+- Bluetooth HFP call recording quality depends on phone/BT stack compatibility — test across devices.
 
 ## License
 
