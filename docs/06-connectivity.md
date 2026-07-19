@@ -1,44 +1,146 @@
-# 06 · Connectivity: The "Drive" on iPhone & Android
+# 06 · Connectivity: BLE + Wi-Fi (Lint Badge v1.0)
 
-The device offloads audio by **enumerating as a USB Mass Storage device** — i.e. it shows up as a
-**drive**. This is the cross-platform, driver-free, license-free path.
+## Dual-mode connectivity
 
-## What works on each platform
+The Lint Badge uses **both BLE and Wi-Fi** — each for a different purpose:
 
-| Method | iPhone (15+, USB-C) | Android | Notes |
+| Protocol | Role | Speed | Range | When active |
+|---|---|---|---|---|
+| **BLE 5.3** | Companion app pairing, live status, quick file transfer | 125 kbps – 2 Mbps | ~30 m | Always (advertising) + when paired |
+| **Wi-Fi 6** | Bulk sync of audio files to LintLabs server | 50–500 Mbps | ~30 m | On-demand (when Wi-Fi available) |
+
+## BLE 5.3 — Companion app pairing
+
+```
+  Lint Badge (BLE Peripheral)  ◄──►  Lint Voice App (BLE Central)
+  ─────────────────────────────        ──────────────────────────
+  GATT Services:                  GATT Services:
+  ┌──────────────────────┐        ┌──────────────────────┐
+  │ Service: Badge Status │        │ Service: Badge Status │
+  │ ─────────────────────│        │ ─────────────────────│
+  │  char: battery_level  │ ◄──── │  Subscribe to notify  │
+  │  char: recording_mode │ ◄──── │  Subscribe to notify  │
+  │  char: battery_pct    │ ◄──── │  Subscribe to notify  │
+  │  char: sd_capacity    │ ◄──── │  Subscribe to notify  │
+  └──────────────────────┘        └──────────────────────┘
+  ┌──────────────────────┐        ┌──────────────────────┐
+  │ Service: File Transfer│        │ Service: File Transfer│
+  │ ─────────────────────│        │ ─────────────────────│
+  │  char: file_list      │ ◄──── │  Request file listing │
+  │  char: file_chunk     │ ◄──── │  Request chunk (≤200B)│
+  └──────────────────────┘        └──────────────────────┘
+  ┌──────────────────────┐        ┌──────────────────────┐
+  │ Service: Control      │        │ Service: Control      │
+  │ ─────────────────────│        │ ─────────────────────│
+  │  char: set_mode       │ ────► │  Write: room/call/    │
+  │  char: delete_file    │ ────► │  Write: filename      │
+  │  char: factory_reset  │ ────► │  Write: confirm       │
+  └──────────────────────┘        └──────────────────────┘
+```
+
+### BLE characteristics
+
+| Characteristic | Direction | Size | Update rate |
 |---|---|---|---|
-| **USB Mass Storage** (shows as a drive) | ✅ **Files app**, natively | ✅ natively | No app/driver/MFi needed. The chosen path. |
-| USB Audio Class (live mic) | ✅ | ✅ | live audio, not stored files — not our use case |
-| **Custom USB protocol → your own app** | ❌ needs Apple **MFi** (expensive, HW-locked) | ⚠️ possible | avoid on iOS |
-| Bluetooth LE → your app | ✅ (ESP32 design only) | ✅ | slower; wireless convenience |
+| `battery_level` | Badge → App | 1 byte | Every 5 s |
+| `recording_mode` | Badge → App | 1 byte | On mode change |
+| `battery_pct` | Badge → App | 1 byte (0–100) | Every 10 s |
+| `sd_capacity` | Badge → App | 2 bytes (used/total MB) | Every 30 s |
+| `file_list` | Badge → App | Variable | On request |
+| `file_chunk` | Badge → App | 200 bytes max | On request |
+| `set_mode` | App → Badge | 1 byte | On user action |
+| `delete_file` | App → Badge | 32 bytes (filename) | On user action |
 
-**Takeaway:** present the recordings as a **drive** (USB MSC). On iPhone they appear in the **Files
-app**; on Android they mount like any USB stick. The partner app reads files from there (share sheet /
-file picker) and uploads for transcription.
+### Pairing
 
-## Power + data at the same time
+- **BLE pairing** — simple numeric comparison (like AirDrop) or just connect with a shared
+  passphrase (stored in badge NVS + app).
+- **No MFi needed** — BLE is open.
+- **Pairing persists** — badge remembers last paired device (stored in NVS flash).
 
-When the phone is USB host, it puts 5 V on the cable and the board is the USB peripheral. The board
-can **charge its battery and act as a USB drive simultaneously** — standard USB behavior.
+## Wi-Fi 6 — Bulk sync to LintLabs
 
-- iPhone supplies limited power (~4.5 W); keep TP4056 charge current modest (~300–500 mA).
-- USB-C **CC1/CC2 each need a 5.1 kΩ pull-down** so the device negotiates as a powered sink.
+```
+  Lint Badge (Wi-Fi Station)  ──TLS──►  LintLabs Server (self-hosted)
+  ──────────────────────────           ──────────────────────────
+  Steps:
+  1. Scan for known Wi-Fi networks (saved in NVS)
+  2. Connect to first available (WPA2/WPA3)
+  3. Authenticate to LintLabs (API key / token)
+  4. Upload completed recordings (chunked, TLS 1.3)
+  5. Delete locally after successful upload
+  6. Disconnect, return to BLE advertising
+```
 
-## Transfer speed
+### Wi-Fi sync details
 
-- **USB** (RP2040/ESP32 native USB, Full-Speed 12 Mbps): ~1 MB/s effective → a full 128 MB dump in ~2 min.
-- **BLE** (ESP32 only): ~50–700 kbps effective → much slower; fine for trickle sync, not bulk.
+| Parameter | Value |
+|---|---|
+| **Protocol** | HTTPS (TLS 1.3) |
+| **Auth** | API key in header or JWT token |
+| **Chunk size** | 1 MB per POST (to avoid timeouts) |
+| **Speed** | ~1–5 MB/s on 2.4 GHz (typical office) |
+| **Full 128 GB sync** | ~7–35 hours (realistic: do partial syncs) |
+| **Power** | ~150–250 mA during sync (battery drains in ~5–7 h) |
 
-USB is the fast path; BLE (if present) is the wireless-convenience path.
+### Sync strategy
 
-## Why this removes the need for Bluetooth
+```
+  On power-on / wake:
+  1. Check if known Wi-Fi is available
+  2. If yes → connect, sync completed recordings, disconnect
+  3. If no → stay on BLE only (no sync)
 
-Because both iPhone and Android read a USB drive natively, the **radio is optional**. That is exactly
-why the recommended design drops the ESP32-S3 in favor of the cheaper, radio-less **RP2040**
-(see [`02-architecture.md`](02-architecture.md)).
+  On app connection (BLE):
+  1. App shows "Upload to Wi-Fi?" button
+  2. User taps → badge connects to Wi-Fi, uploads, returns to BLE
 
-## The MFi caveat (important)
+  Manual sync:
+  1. Long-press Mode button → badge auto-connects to Wi-Fi
+  2. Uploads all unmarked recordings
+  3. Marks them as "synced" (or deletes if configured)
+```
 
-If you ever want **your own iOS app to talk to the device directly over USB** (not via the Files app),
-that requires Apple's **MFi** program — costly and hardware-locked, not realistic for a cheap DIY
-board. Stick to: **USB = drive (Files app)**, **BLE = your app** (ESP32 design only).
+## Bluetooth HFP — Call recording (both sides)
+
+This is the **killer feature** of the Lint Badge: capturing **both sides** of a phone call.
+
+```
+  Phone / Earbuds  ──HFP──►  Lint Badge (HFP Sink)
+  ─────────────────        ───────────────────────
+  What's captured:
+  - Speaker audio (what the other person says)
+  - Microphone audio (what you say)
+  - Both mixed or separate channels
+
+  How it works:
+  1. Phone pairs to Lint Badge via BLE (HFP profile)
+  2. Badge takes over audio routing (phone audio → badge)
+  3. Badge records both channels to SD card
+  4. Badge streams to LintLabs server (via Wi-Fi)
+```
+
+### HFP implementation
+
+- **ESP-IDF BT stack** — `esp_bt_hfp_client` or custom HFP sink implementation.
+- **Tested on:** Android (works well), iOS (limited, LE Audio required).
+- **Quality:** Depends on phone's BT stack — test across devices.
+- **Fallback:** If HFP not supported, use room mode (dual mics) as backup.
+
+## Connectivity summary
+
+| Feature | BLE 5.3 | Wi-Fi 6 | HFP (BT) |
+|---|---|---|---|
+| Pairing | ✅ Simple numeric | ❌ N/A (station mode) | ✅ Phone pairs to badge |
+| Live status | ✅ Battery, mode, SD | ❌ N/A | ❌ N/A |
+| File transfer | ✅ Small files (<10 MB) | ✅ Bulk (128 GB) | ❌ N/A |
+| Call recording | ❌ N/A | ❌ N/A | ✅ Both sides captured |
+| Sync to LintLabs | ❌ (BLE too slow) | ✅ TLS, chunked | ✅ (via Wi-Fi) |
+| Power draw | ~5–20 mA | ~150–250 mA | ~80–120 mA |
+
+## Open decisions
+
+- [ ] **HFP stack** — ESP-IDF built-in vs custom (Android works, iOS needs LE Audio)
+- [ ] **Wi-Fi security** — WPA2 vs WPA3 (office networks vary)
+- [ ] **Sync frequency** — automatic (every charge cycle) vs manual (app-triggered)
+- [ ] **Offline mode** — badge works fully without network (files on SD, sync later)
