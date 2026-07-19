@@ -1,68 +1,172 @@
-# 02 · Architecture & The Big Decision
+# 02 · Architecture & Block Diagram (Lint Badge v1.0)
 
-## Store-and-forward, not live-stream
-
-Early thinking was "stream audio live over Bluetooth." We moved to **store-and-forward**: record to
-local flash, then bulk-transfer when connected. This is strictly better here:
-
-| | Live streaming | **Store-and-forward (chosen)** |
-|---|---|---|
-| Radio/power | radio on constantly = battery killer | radio off while recording → big battery win |
-| Reliability | drop connection = lost audio | audio safe on flash, retransmit anytime |
-| Range | must stay near phone | record anywhere, sync later |
-| Capacity | limited by connection time | hours of audio on cheap flash |
-
-## The MCU decision: RP2040 (USB-only) vs ESP32-S3 (wireless)
-
-The single biggest cost/complexity driver is **whether the device needs a radio**. Because the
-device offloads by **appearing as a USB drive**, Bluetooth is *optional*.
-
-| | **RP2040 (recommended)** | ESP32-S3 |
-|---|---|---|
-| Wireless | ❌ none — must plug in | ✅ BLE sync + USB |
-| USB Mass Storage | ✅ native (TinyUSB) | ✅ native |
-| Audio capture | ✅ PIO does PDM/I²S; ADPCM easy | ✅ I²S + lots of compute |
-| RF / antenna design | none (no radio) | handled by certified module |
-| Unit cost (silicon) | ~$0.80–1.00 | ~$2.50–3.50 (module) |
-| Board complexity | simpler, smaller (~22×42 mm) | larger (module dominates) |
-| Best when… | offloading by cable is fine | you want wireless sync too |
-
-### Decision
-
-**Recommended: RP2040, USB-only.** The mission says the device *"connects to iPhone/Android and
-puts it in the drive"* — that's a USB-Mass-Storage workflow, which works on both platforms without a
-radio. RP2040 is ~1/3 the silicon cost, simpler to route (no RF), and smaller.
-
-**Keep ESP32-S3 if** wireless background sync (no cable) becomes a hard requirement later. The
-firmware concepts are the same; only the offload transport differs.
-
-## Block diagram (RP2040 design)
+## High-level block diagram
 
 ```
-USB-C ──┬─► CC resistors (sink) ──► VBUS
-        │
-        ├─► TP4056 Li-Po charger ──► battery ──┐
-        │                                      ├─► ME6211 3.3V LDO ─► 3V3 rail
-        │                          (battery) ──┘
-        │
-        └─► USB D+/D- ──► RP2040 ──(QSPI)── boot NOR flash
-                            │
-                            ├──(SPI)──► W25N01 128MB NAND  (audio storage)
-                            ├──(PIO/I²S)──► MEMS PDM mic
-                            ├──► status LED
-                            └──► buttons (reset / user)
-
-  RP2040 enumerates over USB as MASS STORAGE → phone sees a drive.
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                        LINT BADGE v1.0                                │
+  │                                                                     │
+  │  ┌──────────┐    I2S     ┌──────────┐    I2S     ┌────────────────┐  │
+  │  │ MIC 1    │ ─────────► │          │ ─────────► │                │  │
+  │  │ICS-43434 │          │          │          │  SD CARD SLOT    │  │
+  │  └──────────┘          │  ESP32   │          │  (128 GB U3)   │  │
+  │  ┌──────────┐    I2S   │  C6-MINI │          │                │  │
+  │  │ MIC 2    │ ─────────► │  -1      │          └────────────────┘  │
+  │  │ICS-43434 │          │  (4MB)   │                                  │
+  │  └──────────┘          │          │    ┌───────────────────────┐   │
+  │                        │          │    │  BLUETOOTH STACK      │   │
+  │  ┌──────────┐         │  ES8311  │    │  (HFP Sink + BLE 5.3)│   │
+  │  │ ES8311   │ ◄────── │  Codec   │    │                       │   │
+  │  │ (optional)│        │          │    │  ◄── Phone/Earbuds   │   │
+  │  └──────────┘         └──────────┘    └───────────────────────┘   │
+  │         ▲                          │                               │
+  │         │ I2C                      │ USB-C                       │
+  │  ┌──────┴──────┐                   │ (charge + DFU)              │
+  │  │ MAX17048    │                   │                               │
+  │  │ Fuel Gauge  │                   │                               │
+  │  └──────┬──────┘                   │                               │
+  │         │                          │                               │
+  │  ┌──────┴──────┐    Buck-Boost    │                               │
+  │  │ TPS63101    │ ◄────────────────┘                               │
+  │  └──────┬──────┘                                                   │
+  │         │ 3.3V Rail                                                │
+  │  ┌──────┴──────┐  ┌──────────┐  ┌──────────┐  ┌────────────────┐  │
+  │  │ 3 Buttons   │  │ WS2812B  │  │ Neodym.  │  │ 1200 mAh     │  │
+  │  │ PWR/Mode/   │  │ RGB LED  │  │ Magnets  │  │ LiPo (JST)   │  │
+  │  │ Whisper     │  │          │  │ (2×10×5) │  │                │  │
+  │  └─────────────┘  └──────────┘  └──────────┘  └────────────────┘  │
+  │                                                                     │
+  │  Enclosure: 55 × 35 × 12 mm resin (retro badge), IP54               │
+  └─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Firmware responsibilities (same for either MCU)
+## MCU: ESP32-C6-MINI-1 (why this chip)
 
-1. **VAD** — analyze incoming mic samples; start recording above a sound threshold, stop after silence.
-2. **Compress** — ADPCM encode (cheap, ~4:1).
-3. **Filesystem** — LittleFS on NAND with wear leveling; one file per recording, timestamped.
-4. **USB MSC** — when plugged in, expose the recordings as a FAT/USB drive.
-5. **Power management** — sleep aggressively between sound events; this is the #1 battery lever.
+The ESP32-C6 is the **only single-chip solution** that gives us everything needed:
 
-> Note: prototype the firmware on **off-the-shelf dev boards** (RP2040 + I²S mic breakout, ~$13 total),
-> or in the browser via **Wokwi**, *before* committing to a custom PCB. That is the realistic
-> "simulation" — SPICE cannot test firmware/USB/RF behavior.
+| Feature | Why it matters for Lint Badge |
+|---|---|
+| **Wi-Fi 6 (802.11ax)** | Fast bulk sync of audio files to LintLabs server |
+| **BLE 5.3** | Low-energy companion app pairing, live status, OTA updates |
+| **802.15.4** | Future-proof for Thread/Zigbee sensor expansion |
+| **HFP Sink** | Can pair with phone/earbuds and capture **both** call sides |
+| **I2S interface** | Drive dual MEMS mics at 16 kHz / 16-bit |
+| **4 MB Flash** | Firmware + small audio buffer (SD handles the rest) |
+| **~$8.50** | Affordable for 100-unit pilot |
+
+> **Not ESP32-S3** — the S3 lacks Wi-Fi 6 and its BLE is older. The C6 is the right step up for
+> a product that needs both fast Wi-Fi sync and modern BLE.
+
+## Audio architecture
+
+### Path 1: Dual MEMS mics (Room mode — default)
+
+```
+  MEMS MIC 1 (ICS-43434) ──I2S──┐
+                                ├─► ESP32-C6 ──► ADPCM/PCM ──► SD card
+  MEMS MIC 2 (ICS-43434) ──I2S──┘
+```
+
+- **Stereo recording** — two mics spaced ~30 mm apart on the badge.
+- **ESP-SR noise suppression** — on-device beamforming + environmental noise cancellation.
+- **16 kHz, 16-bit mono** (summed stereo) for transcription-quality audio.
+
+### Path 2: Bluetooth HFP (Call mode)
+
+```
+  Phone / Earbuds ──HFP──► Lint Badge (HFP Sink)
+                              │
+                              └─► Captures BOTH sides of the call
+                              └─► Streams to SD / LintLabs server
+```
+
+- The badge acts as a **Hands-Free Profile (HFP) sink**.
+- Phone pairs to the badge instead of (or in addition to) earbuds.
+- **Both speaker and microphone audio** captured.
+- Tested with Android + iOS (LE Audio on newer devices).
+
+### Path 3: Whisper mode (quick note)
+
+- Long-press the **Whisper button** → single mic, boosted gain.
+- 3-second beep confirms activation.
+- File tagged `whisper_YYYYMMDD_HHMMSS.wav`.
+
+## Firmware stack (ESP-IDF)
+
+```
+firmware/
+└── main/
+    ├── audio/
+    │   ├── mic_i2s.c          ← Dual I2S mic capture (16 kHz, 16-bit)
+    │   ├── codec_es8311.c     ← ES8311 codec init (optional, line-in)
+    │   ├── vad.c              ← Voice activity detection (on-device)
+    │   ├── encoder.c          ← ADPCM / PCM encoder (to SD)
+    │   └── noise_suppress.c   ← ESP-SR environmental noise cancellation
+    ├── bluetooth/
+    │   ├── hfp_sink.c         ← HFP sink for call capture (both sides)
+    │   ├── ble_gap.c          ← BLE advertising + GATT server
+    │   └── ble_gatt.c         ← GATT services: battery, status, file transfer
+    ├── storage/
+    │   ├── sd_card.c          ← SD card init, FATFS, file creation
+    │   └── file_manager.c     ← Recording lifecycle (create, append, close)
+    ├── power/
+    │   ├── pmu.c              ← TP4056 charge + TPS63101 buck-boost
+    │   ├── fuel_gauge.c       ← MAX17048 battery % via I2C
+    │   └── sleep.c            ← Deep sleep / light sleep strategies
+    ├── connectivity/
+    │   ├── wifi.c             ← Wi-Fi station mode (sync to LintLabs)
+    │   └── sync.c             ← Encrypted upload (TLS) + chunked transfer
+    ├── ui/
+    │   ├── buttons.c          ← PWR / Mode / Whisper (debounce, long-press)
+    │   └── led.c              ← WS2812B RGB (status colors)
+    ├── modes/
+    │   ├── room_mode.c        ← Dual mic, noise suppression, VAD
+    │   ├── call_mode.c        ← HFP sink, call detection, recording
+    │   └── whisper_mode.c     ← Single mic, boosted gain, quick note
+    ├── app/
+    │   └── app_main.c         ← Entry point, mode scheduler, event loop
+    └── CMakeLists.txt
+```
+
+## Sync architecture
+
+```
+  Lint Badge ──BLE 5.3──► Lint Voice App (iOS/Android/Mac)
+                          │
+                          ├─ Live: battery %, recording status, mode
+                          └─ Quick: single-file transfer (BLE, <10 MB)
+
+  Lint Badge ──Wi-Fi 6──► LintLabs Server (self-hosted)
+                          │
+                          ├─ Bulk: 1000+ hours of audio (chunked, TLS)
+                          ├─ Transcription: Whisper / Qwen ASR
+                          ├─ Summarization: DeepSeek/Grok agent
+                          └─ Push: ERPNext / Slack / Notion / Obsidian
+```
+
+**Key design: BLE for status + small files, Wi-Fi for bulk.** BLE alone is too slow for 128 GB.
+
+## Decision: why ESP32-C6 over RP2040
+
+| | RP2040 (previous) | **ESP32-C6 (Lint Badge)** |
+|---|---|---|
+| Radio | ❌ none | ✅ Wi-Fi 6 + BLE 5.3 + 802.15.4 |
+| Call recording | ❌ impossible | ✅ HFP sink (both sides) |
+| Sync | USB cable only | BLE (live) + Wi-Fi (bulk) |
+| Noise suppression | Basic PIO | ✅ ESP-SR (on-device) |
+| Storage | 128 MB NAND | ✅ 128 GB SD card |
+| Battery life | ~1.5–2.5 days (VAD) | 8–10 hours (continuous) |
+| Form factor | Bare PCB | ✅ Badge (55×35×12 mm) |
+| Cost | ~$5–8 | ~$48–62 |
+| Complexity | Low | Moderate (radio + audio + power) |
+
+The C6 adds meaningful complexity but delivers a **complete, polished product** that replaces
+the need for a dedicated phone app for call recording.
+
+## Open decisions
+
+- [ ] **ES8311 vs TLV320AIC3104** — codec choice (both work, ES8311 is cheaper)
+- [ ] **SD card vs eMMC** — SD is swappable (128 GB, $4.20); eMMC is soldered (64 GB, $3–8)
+- [ ] **E-ink display** — optional small e-ink for quick notes on the badge ($8–12)
+- [ ] **Battery size** — 1200 mAh (default) vs 1500 mAh for margin
+- [ ] **Firmware: ESP-IDF vs Arduino** — ESP-IDF for full control; Arduino for rapid prototyping
